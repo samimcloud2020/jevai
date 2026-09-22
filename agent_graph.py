@@ -1,53 +1,48 @@
-from typing import Annotated, Dict, List, Any, Optional
-from langgraph.graph import StateGraph, START, END
+from typing import Annotated, Any, Dict, List, Optional
+from typing_extensions import TypedDict
+from langgraph.graph import START, END, StateGraph
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from jev_utils import guard_tool_call, review_completion
 
-# ---------- State ----------
+# --- Typed State ---
 
-class AgentState(dict):
+class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
-    tool_calls: List[Dict[str, Any]]
-    tool_outputs: List[Dict[str, Any]]
-    last_decision: Optional[Dict[str, Any]]
     goal: Optional[str]
+    tool_outputs: List[Dict[str, Any]]
 
+# --- Tools Definitions & Logic ---
 
-# ---------- LLM ----------
-
-llm = ChatOpenAI(model="gpt-4.1", temperature=0)  # or your preferred model
-
-
-# ---------- Tools (stubs) ----------
+TOOL_POLICIES = {
+    "checkout": {
+        "policy": ["Payment captured upon order creation."],
+        "side_effects": ["Charges customer"],
+    },
+    "issue_refund": {
+        "policy": ["Refunds above $500 require approval."],
+        "side_effects": ["Moves funds"],
+    },
+}
 
 def get_catalog_info(query: str) -> Dict[str, Any]:
     return {"result": f"Catalog info for: {query}"}
 
-
 def add_to_cart(user_id: str, product_id: str, qty: int) -> Dict[str, Any]:
     return {"status": "ok", "user_id": user_id, "product_id": product_id, "qty": qty}
 
-
-def checkout(user_id: str, cart_id: str, address: Dict[str, str]) -> Dict[str, Any]:
+def checkout(user_id: str, cart_id: str, address: Dict[str, str], **_) -> Dict[str, Any]:
     return {
         "status": "ok",
         "order_id": "ord_12345",
-        "user_id": user_id,
+        "user_id": cart_id,
         "items": [{"product_id": "prod_777", "qty": 2}],
         "ship_to": address,
     }
 
-
 def issue_refund(order_id: str, amount_usd: float, reason: str) -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "refund_id": "ref_999",
-        "order_id": order_id,
-        "amount_usd": amount_usd,
-    }
-
+    return {"status": "ok", "refund_id": "ref_999", "order_id": order_id, "amount_usd": amount_usd}
 
 TOOLS = {
     "get_catalog_info": get_catalog_info,
@@ -56,34 +51,28 @@ TOOLS = {
     "issue_refund": issue_refund,
 }
 
-TOOL_DEFINITIONS = [
+TOOL_SCHEMAS = [
     {
         "name": "get_catalog_info",
         "description": "Get product/catalog information.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "User query about products"}
-            },
+            "properties": {"query": {"type": "string"}},
             "required": ["query"],
         },
     },
     {
         "name": "add_to_cart",
-        "description": "Add a product to the user's cart.",
+        "description": "Add product to cart.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "user_id": {"type": "string"},
-                "product_id": {"type": "string"},
-                "qty": {"type": "integer"},
-            },
+            "properties": {"user_id": {"type": "string"}, "product_id": {"type": "string"}, "qty": {"type": "integer"}},
             "required": ["user_id", "product_id", "qty"],
         },
     },
     {
         "name": "checkout",
-        "description": "Place an order from the user's cart.",
+        "description": "Place an order.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -91,13 +80,7 @@ TOOL_DEFINITIONS = [
                 "cart_id": {"type": "string"},
                 "address": {
                     "type": "object",
-                    "properties": {
-                        "line1": {"type": "string"},
-                        "city": {"type": "string"},
-                        "state": {"type": "string"},
-                        "country": {"type": "string"},
-                        "pin": {"type": "string"},
-                    },
+                    "properties": {"line1": {"type": "string"}, "city": {"type": "string"}, "state": {"type": "string"}, "country": {"type": "string"}, "pin": {"type": "string"}},
                     "required": ["line1", "city", "state", "country", "pin"],
                 },
             },
@@ -106,148 +89,85 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "issue_refund",
-        "description": "Issue a refund for an order.",
+        "description": "Issue order refund.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "order_id": {"type": "string"},
-                "amount_usd": {"type": "number"},
-                "reason": {"type": "string"},
-            },
+            "properties": {"order_id": {"type": "string"}, "amount_usd": {"type": "number"}, "reason": {"type": "string"}},
             "required": ["order_id", "amount_usd", "reason"],
         },
     },
 ]
 
-llm_with_tools = llm.bind_tools(TOOL_DEFINITIONS)
+llm = ChatOpenAI(model="gpt-4.1", temperature=0).bind_tools(TOOL_SCHEMAS)
 
+# --- Graph Nodes ---
 
-# ---------- Nodes ----------
+def agent_node(state: AgentState) -> Dict[str, Any]:
+    sys_msg = SystemMessage(
+        content=f"You are an e-commerce assistant. Target Goal: {state.get('goal') or 'N/A'}"
+    )
+    response = llm.invoke([sys_msg] + state["messages"])
+    return {"messages": [response]}
 
-def agent_node(state: AgentState) -> AgentState:
-    messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
-    return {
-        "messages": [response],
-        "tool_calls": getattr(response, "tool_calls", []) or [],
-    }
-
-
-def tools_node(state: AgentState) -> AgentState:
-    tool_calls = state.get("tool_calls", [])
-    outputs = []
+def tools_node(state: AgentState) -> Dict[str, Any]:
+    last_msg = state["messages"][-1]
     tool_messages = []
+    tool_outputs = list(state.get("tool_outputs", []))
 
-    for tc in tool_calls:
-        name = tc["name"]
-        args = tc["args"]
-        tool_call_id = tc["id"]
-        tool_fn = TOOLS[name]
-
-        # Decide if we need a Jev guard
-        needs_guard = name in ("checkout", "issue_refund")
-
-        if needs_guard:
-            action_summary = f"{name} with args: {args}"
-
-            if name == "checkout":
-                policy = ["Payment is captured; order is created."]
-                safeguards = ["Address validated; payment method on file."]
-                side_effects = ["Charges customer", "Creates order record"]
-                reversibility = "partially_reversible"
-            elif name == "issue_refund":
-                policy = ["Refunds above USD 500 require human approval."]
-                safeguards = ["Order ownership and issue reason verified."]
-                side_effects = ["Moves funds", "Changes order payment state"]
-                reversibility = "partially_reversible"
-            else:
-                policy = []
-                safeguards = []
-                side_effects = []
-                reversibility = "fully_reversible"
-
-            decision = guard_tool_call(
-                tool=name,
-                action=action_summary,
-                arguments_summary=[str(args)],
-                side_effects=side_effects,
-                safeguards=safeguards,
-                policy=policy,
-                reversibility=reversibility,
+    for tc in getattr(last_msg, "tool_calls", []):
+        name, args, call_id = tc["name"], tc["args"], tc["id"]
+        
+        # Guard check
+        if name in TOOL_POLICIES:
+            config = TOOL_POLICIES[name]
+            guard = guard_tool_call(name, args, config["policy"], config["side_effects"])
+            
+            is_blocked = (
+                guard["decision"] == "deny"
+                or (name == "issue_refund" and args.get("amount_usd", 0) > 500)
             )
-
-            # Dev mode: only block on explicit "deny"
-            if decision["decision"] == "deny":
-                msg_text = (
-                    f"I cannot perform `{name}` automatically. "
-                    f"Decision: {decision['decision']}, confidence: {decision['confidence']:.2f}. "
-                    f"Reason: {decision.get('guidance') or 'Policy/risk constraints.'}"
-                )
-                outputs.append({"status": "blocked_by_policy", "tool": name, "message": msg_text})
-                tool_messages.append(
-                    ToolMessage(content=msg_text, tool_call_id=tool_call_id)
-                )
+            
+            if is_blocked:
+                msg = f"Action `{name}` blocked by policy or high-risk evaluation."
+                tool_messages.append(ToolMessage(content=msg, tool_call_id=call_id))
+                tool_outputs.append({
+                    "status": "blocked",
+                    "tool": name,
+                    "result": {"error": msg}
+                })
                 continue
 
-        # Execute tool
-        result = tool_fn(**args)
-        outputs.append({"status": "ok", "tool": name, "result": result})
+        # Execute safe tool
+        res = TOOLS[name](**args)
+        tool_messages.append(ToolMessage(content=f"Result: {res}", tool_call_id=call_id))
+        
+        # Append structured tool execution record
+        tool_outputs.append({
+            "status": res.get("status", "ok"),
+            "tool": name,
+            "result": res
+        })
 
-        # Create a proper ToolMessage
-        tool_messages.append(
-            ToolMessage(content=f"Tool {name} result: {result}", tool_call_id=tool_call_id)
-        )
+    return {"messages": tool_messages, "tool_outputs": tool_outputs}
 
-    return {
-        "messages": tool_messages,
-        "tool_outputs": outputs,
-        "last_decision": None,
-    }
-
-
-def completion_check_node(state: AgentState) -> AgentState:
-    goal = state.get("goal")
-    if not goal:
-        return {}
-
-    msgs = state.get("messages", [])
-    state_summary = "\n".join(
-        [f"{m.type}: {m.content}" for m in msgs[-6:] if hasattr(m, "content") and m.content]
-    )
-
-    result = review_completion(state_summary, goal)
-
-    if result["status"] != "complete" or result["confidence"] < 0.5:
-        msg = AIMessage(
-            content=(
-                "I'm not fully sure this task is complete yet. "
-                f"Jev assessment: {result['status']}, confidence: {result['confidence']:.2f}. "
-                "Do you want me to continue or is this good enough?"
-            )
-        )
-        return {"messages": [msg]}
-
+def completion_check_node(state: AgentState) -> Dict[str, Any]:
+    # Pass-through node; does not pollute message history
     return {}
 
+# --- Builder ---
 
-# ---------- Graph ----------
+def build_agent_graph():
+    builder = StateGraph(AgentState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", tools_node)
+    builder.add_node("completion_check", completion_check_node)
 
-def build_agent_graph() -> StateGraph:
-    graph = StateGraph(AgentState)
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges(
+        "agent",
+        lambda state: "tools" if getattr(state["messages"][-1], "tool_calls", None) else "completion_check",
+    )
+    builder.add_edge("tools", "agent")
+    builder.add_edge("completion_check", END)
 
-    graph.add_node("agent", agent_node)
-    graph.add_node("tools", tools_node)
-    graph.add_node("completion_check", completion_check_node)
-
-    graph.add_edge(START, "agent")
-
-    def route_after_agent(state: AgentState):
-        if state.get("tool_calls"):
-            return "tools"
-        return "completion_check"
-
-    graph.add_conditional_edges("agent", route_after_agent)
-    graph.add_edge("tools", "agent")
-    graph.add_edge("completion_check", END)
-
-    return graph.compile()
+    return builder.compile()

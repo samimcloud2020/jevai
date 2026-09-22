@@ -1,70 +1,62 @@
-import os
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from langchain_core.messages import HumanMessage
-from agent_graph import build_agent_graph
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from langchain_core.messages import AIMessage, HumanMessage
+from pydantic import BaseModel
+from agent_graph import build_agent_graph
+
 load_dotenv(override=True)
 
 app = FastAPI()
-
 agent = build_agent_graph()
-
 
 class ChatRequest(BaseModel):
     user_id: str
     message: str
-    goal: Optional[str] = None  # e.g. "Place an order for product X"
-    history: Optional[List[Dict[str, str]]] = None  # [{role: "user"|"assistant", content: "..."}]
+    goal: Optional[str] = None
+    history: Optional[List[Dict[str, str]]] = None
 
+class StateSnapshot(BaseModel):
+    tool_outputs: List[Dict[str, Any]]
+    goal: Optional[str] = None
 
 class ChatResponse(BaseModel):
     reply: str
-    state_snapshot: Dict[str, Any]
-
+    state_snapshot: StateSnapshot
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    # Build messages
-    messages: List[HumanMessage | AIMessage] = []
+    messages = []
+    
     if req.history:
         for m in req.history:
-            role = m.get("role", "")
-            content = m.get("content", "")
+            role, content = m.get("role"), m.get("content", "")
             if role == "user":
                 messages.append(HumanMessage(content=content))
             elif role == "assistant":
-                from langchain_core.messages import AIMessage
                 messages.append(AIMessage(content=content))
 
     messages.append(HumanMessage(content=req.message))
 
-    initial_state = {
-        "messages": messages,
-        "tool_calls": [],
-        "tool_outputs": [],
-        "last_decision": None,
-        "goal": req.goal,
-    }
-
     try:
-        final_state = agent.invoke(initial_state)
+        final_state = agent.invoke({
+            "messages": messages,
+            "goal": req.goal,
+            "tool_outputs": [],
+        })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Last assistant message as reply
-    msgs = final_state.get("messages", [])
-    reply = ""
-    for m in reversed(msgs):
-        if hasattr(m, "content") and m.content:
-            reply = m.content
-            break
+    # Get the last AI message with non-empty content
+    reply_msg = next(
+        (m.content for m in reversed(final_state["messages"]) if isinstance(m, AIMessage) and m.content),
+        ""
+    )
 
-    # Strip internal fields for response
-    state_snapshot = {
-        "tool_outputs": final_state.get("tool_outputs", []),
-        "goal": final_state.get("goal"),
-    }
-
-    return ChatResponse(reply=reply, state_snapshot=state_snapshot)
+    return ChatResponse(
+        reply=str(reply_msg),
+        state_snapshot=StateSnapshot(
+            tool_outputs=final_state.get("tool_outputs", []),
+            goal=final_state.get("goal")
+        )
+    )
